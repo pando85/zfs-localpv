@@ -73,6 +73,15 @@ func New(config *config.Config) *CSIDriver {
 		// property change, handle it accordingly.
 
 		driver.ns = NewNode(driver)
+	case "backupGC":
+		// Initialize and run the backup garbage collector
+		// to monitor and clean up orphaned backups
+		klog.Info("Initializing backup garbage collector")
+		bgc := &BackupGarbageCollector{}
+		if err := bgc.Initialize(); err != nil {
+			klog.Fatalf("Failed to initialize backup garbage collector: %v", err)
+		}
+		klog.Info("Backup garbage collector initialized successfully")
 	}
 
 	// Identity server is common to both node and
@@ -86,7 +95,17 @@ func New(config *config.Config) *CSIDriver {
 // Run starts the CSI plugin by communicating
 // over the given endpoint
 func (d *CSIDriver) Run() error {
-	// Initialize and start listening on grpc server
+	// For backupGC plugin type, we don't need to start a CSI gRPC server
+	// since it just runs the backup garbage collector
+	if d.config.PluginType == "backupGC" {
+		klog.Info("Running in backup garbage collector mode - no CSI gRPC server needed")
+		// Use a channel to keep the process alive
+		forever := make(chan struct{})
+		<-forever
+		return nil
+	}
+
+	// Initialize and start listening on grpc server for controller and agent plugin types
 	s := NewNonBlockingGRPCServer(d.config.Endpoint, d.ids, d.cs, d.ns)
 
 	s.Start()
