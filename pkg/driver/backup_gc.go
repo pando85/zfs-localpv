@@ -26,7 +26,6 @@ import (
 	clientset "github.com/openebs/zfs-localpv/pkg/generated/clientset/internalclientset"
 	informers "github.com/openebs/zfs-localpv/pkg/generated/informer/externalversions"
 	"github.com/openebs/zfs-localpv/pkg/zfs"
-	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/runtime/signals"
@@ -102,15 +101,12 @@ func (bgc *BackupGarbageCollector) Initialize() error {
 
 	bgc.zfsBackupInformer = openebsInformerFactory.Zfs().V1().ZFSBackups().Informer()
 
-	// Add indexers to the informer for efficient lookup
 	if err = bgc.setupIndexers(); err != nil {
 		return errors.Wrapf(err, "failed to set up informer indexers")
 	}
 
-	// Register event handlers for monitoring backup resources
 	bgc.registerEventHandlers()
 
-	// Start the informer and wait for the cache to sync
 	return bgc.startAndWaitForInformer(stopCh)
 }
 
@@ -156,7 +152,7 @@ func (bgc *BackupGarbageCollector) handleBackupCreation(obj interface{}) {
 		return
 	}
 
-	klog.V(4).InfoS("Processing backup creation", "backupName", backup.Name)
+	klog.InfoS("Processing backup creation", "backupName", backup.Name)
 
 	// Check if the backup references a prevSnapName that doesn't exist
 	if backup.Spec.PrevSnapName != "" {
@@ -180,7 +176,7 @@ func (bgc *BackupGarbageCollector) handleBackupUpdate(oldObj, newObj interface{}
 		return
 	}
 
-	klog.V(4).InfoS("Processing backup update",
+	klog.InfoS("Processing backup update",
 		"backupName", newBackup.Name,
 		"prevSnapshot", newBackup.Spec.PrevSnapName)
 
@@ -210,7 +206,7 @@ func (bgc *BackupGarbageCollector) handleBackupDeletion(obj interface{}) {
 		}
 	}
 
-	klog.V(4).InfoS("Processing backup deletion",
+	klog.InfoS("Processing backup deletion",
 		"backupName", backup.Name,
 		"volumeName", backup.Spec.VolumeName,
 		"snapshot", backup.Spec.SnapName)
@@ -226,31 +222,29 @@ func (bgc *BackupGarbageCollector) validateBackupPrevSnapName(backup *zfsapi.ZFS
 		return
 	}
 
-	// Generate lookup key for the parent backup
 	parentBackupKey := bgc.getBackupKeyBySpec(
 		backup.Spec.VolumeName,
 		backup.Spec.OwnerNodeID,
 		backup.Spec.PrevSnapName)
 
-	// Check if the prevSnapName exists as another backup
-	_, err := bgc.zfsBackupInformer.GetIndexer().ByIndex(BackupSnapshotIndex, parentBackupKey)
+	parentItem, err := bgc.zfsBackupInformer.GetIndexer().ByIndex(BackupSnapshotIndex, parentBackupKey)
 	if err != nil {
-		if k8serror.IsNotFound(err) {
-			// PrevSnapName doesn't exist, delete the backup
-			klog.InfoS("Deleting backup with invalid previous snapshot reference",
-				"backupName", backup.Name,
-				"prevSnapshotName", backup.Spec.PrevSnapName)
+		klog.ErrorS(err, "Error validating previous snapshot reference for backup",
+			"backupName", backup.Name,
+			"prevSnapshotName", backup.Spec.PrevSnapName)
+		return
+	}
+	if len(parentItem) == 0 {
+		// PrevSnapName doesn't exist, delete the backup
+		klog.InfoS("Deleting backup with invalid previous snapshot reference",
+			"backupName", backup.Name,
+			"prevSnapshotName", backup.Spec.PrevSnapName)
 
-			deleteErr := bkpbuilder.NewKubeclient().WithNamespace(zfs.OpenEBSNamespace).Delete(backup.Name)
+		deleteErr := bkpbuilder.NewKubeclient().WithNamespace(zfs.OpenEBSNamespace).Delete(backup.Name)
 
-			if deleteErr != nil {
-				klog.ErrorS(deleteErr, "Failed to delete backup with invalid previous snapshot reference",
-					"backupName", backup.Name)
-			}
-		} else {
-			klog.ErrorS(err, "Error validating previous snapshot reference for backup",
-				"backupName", backup.Name,
-				"prevSnapshotName", backup.Spec.PrevSnapName)
+		if deleteErr != nil {
+			klog.ErrorS(deleteErr, "Failed to delete backup with invalid previous snapshot reference",
+				"backupName", backup.Name)
 		}
 	}
 }
@@ -284,7 +278,7 @@ func (bgc *BackupGarbageCollector) deleteBackupsReferencingDeletedBackup(backup 
 
 	// No dependent backups found
 	if len(possibleChildBackups) == 0 {
-		klog.V(5).InfoS("No dependent backups found that reference deleted backup",
+		klog.InfoS("No dependent backups found that reference deleted backup",
 			"backupName", backup.Name,
 			"snapshot", backup.Spec.SnapName)
 		return
