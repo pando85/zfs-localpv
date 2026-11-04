@@ -1,0 +1,116 @@
+name: Fork image build
+
+# Fork-local workflow: publishes a patched zfs-driver to ghcr.io/pando85 so the
+# homelab cluster can run the netcat-timeout fix before it lands upstream.
+# Deliberately scoped to fork/** branches so none of the upstream workflows
+# (which push to the openebs org) are triggered.
+#
+# GITHUB_TOKEN cannot write packages from this fork — empirically confirmed
+# ("denied: permission_denied: write_package"). Adding the
+# org.opencontainers.image.source label did not resolve it either. A classic
+# PAT with write:packages is stored as the repository secret GHCR_PAT.
+#
+# Refs: https://github.com/openebs/zfs-localpv/issues/773
+
+on:
+  push:
+    branches:
+      - 'fork/**'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag to publish under ghcr.io/pando85/zfs-driver'
+        required: false
+        default: '2.11.2-nc-timeout'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/pando85/zfs-driver
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "${TAG}" ]; then
+            TAG="${GITHUB_REF_NAME#fork/}"
+          fi
+          if [ -z "${TAG}" ] || [ "${TAG}" = "${GITHUB_REF_NAME}" ] && [[ "${GITHUB_REF_NAME}" != fork/* ]]; then
+            echo "::error::Could not derive an image tag; refuse to guess."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${IMAGE}:${TAG}"
+
+      - name: Check the registry credential is configured
+        env:
+          PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          if [ -z "${PAT}" ]; then
+            echo "::error::Repository secret GHCR_PAT is not set. GITHUB_TOKEN cannot write packages from this fork."
+            exit 1
+          fi
+          echo "GHCR_PAT is set (length ${#PAT})."
+
+      # Login before buildx setup — defensive best practice so the credential
+      # is in place before any builder is created.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./buildscripts/zfs-driver/Dockerfile.buildx
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          # OCI source label links the image to the repository on GHCR; kept for
+          # provenance even though the PAT (not GITHUB_TOKEN) handles auth.
+          labels: |
+            org.opencontainers.image.source=https://github.com/pando85/zfs-localpv
+            org.opencontainers.image.description=OpenEBS ZFS LocalPV driver with a configurable netcat idle timeout (fork of v2.11.2)
+            org.opencontainers.image.licenses=Apache-2.0
+          build-args: |
+            DBUILD_DATE=${{ github.event.head_commit.timestamp }}
+            DBUILD_REPO_URL=https://github.com/pando85/zfs-localpv
+            DBUILD_SITE_URL=https://openebs.io
+            BRANCH=${{ github.ref_name }}
+
+      # Fail loudly if the patch did not make it into the published binary: a
+      # silently unpatched driver would keep truncating backups while looking fixed.
+      - name: Verify the fix is present in the published image
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${{ steps.tag.outputs.tag }}"
+          docker pull "${REF}"
+          cid="$(docker create "${REF}")"
+          docker cp "${cid}:/usr/local/bin/zfs-driver" ./zfs-driver
+          docker rm "${cid}" >/dev/null
+          hits="$(grep -ac 'ZFS_NETCAT_TIMEOUT' ./zfs-driver || true)"
+          echo "ZFS_NETCAT_TIMEOUT occurrences in binary: ${hits}"
+          if [ "${hits}" -eq 0 ]; then
+            echo "::error::Published image does not contain the netcat-timeout patch."
+            exit 1
+          fi
+          # OpenBSD netcat's -h exits non-zero by design; wrap in { ... || true; }
+          # so that cannot spuriously fail the step under set -e.
+          docker run --rm --entrypoint sh "${REF}" -c 'command -v nc && { nc -h 2>&1 || true; } | head -3'
