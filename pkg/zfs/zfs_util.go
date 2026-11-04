@@ -67,6 +67,20 @@ const (
 // NetCatCmd streams backup/restore data to/from the remote endpoint.
 const NetCatCmd = "nc"
 
+// NetCatTimeoutEnv is the environment variable that overrides the netcat
+// inactivity timeout (-w) used by the backup and restore pipelines.
+const NetCatTimeoutEnv = "ZFS_NETCAT_TIMEOUT"
+
+// defaultNetCatTimeout is the default netcat inactivity timeout in seconds.
+// The -w flag is an idle timeout on the established connection: if no fd has
+// activity for this duration, nc exits. The previous hardcoded value of 3s
+// was too aggressive — the receiver may stop draining the socket for longer
+// than 3s while flushing a large multipart to S3, causing nc to exit, zfs
+// send to die with SIGPIPE, and the receiver to upload a truncated object
+// (see https://github.com/openebs/zfs-localpv/issues/773). 300s is far above
+// any plausible flush while still bounding a truly stalled connection.
+const defaultNetCatTimeout = "300"
+
 // runCmd executes cmd, logs the invocation at V(4) and full output at V(5),
 // and returns combined stdout+stderr. Use this instead of cmd.CombinedOutput()
 // throughout this package so verbosity can be tuned with --v.
@@ -415,6 +429,18 @@ func buildVolumeResizeArgs(vol *apis.ZFSVolume) []string {
 	return ZFSVolArg
 }
 
+// netCatTimeout returns the netcat inactivity timeout (-w) in seconds.
+// It reads ZFS_NETCAT_TIMEOUT from the environment; if unset or empty, the
+// default (300s) is used. The -w flag bounds how long nc waits with no
+// activity on the connection before exiting — it must not be removed, as nc
+// sets no TCP keepalive and an unbounded hang was fixed by PR #777.
+func netCatTimeout() string {
+	if v := os.Getenv(NetCatTimeoutEnv); v != "" {
+		return v
+	}
+	return defaultNetCatTimeout
+}
+
 // buildVolumeBackupArgs returns the argv vectors for the `zfs send` and `nc`
 // processes of the backup pipeline, connected via runPipe.
 func buildVolumeBackupArgs(bkp *apis.ZFSBackup, vol *apis.ZFSVolume) (sendArgs []string, ncArgs []string, err error) {
@@ -436,7 +462,7 @@ func buildVolumeBackupArgs(bkp *apis.ZFSBackup, vol *apis.ZFSVolume) (sendArgs [
 		sendArgs = append(sendArgs, curSnap)
 	}
 
-	ncArgs = []string{"-w", "3", bkpAddr[0], bkpAddr[1]}
+	ncArgs = []string{"-w", netCatTimeout(), bkpAddr[0], bkpAddr[1]}
 
 	return sendArgs, ncArgs, nil
 }
@@ -454,7 +480,7 @@ func buildVolumeRestoreArgs(rstr *apis.ZFSRestore) (ncArgs []string, recvArgs []
 		return nil, nil, fmt.Errorf("zfs: invalid restore server address %s", restoreSrc)
 	}
 
-	ncArgs = []string{"-w", "3", rstrAddr[0], rstrAddr[1]}
+	ncArgs = []string{"-w", netCatTimeout(), rstrAddr[0], rstrAddr[1]}
 
 	recvArgs = []string{ZFSRecvArg}
 
